@@ -44,14 +44,15 @@ cp "$(brew --prefix claude-slack-bridge)/libexec/config.env.default" \
 chmod 600 ~/.config/claude-slack-bridge/config.env
 ```
 
-Then edit it. The template documents every setting; the three that must be
-right before the first start:
+Then edit it. The template documents every setting; these must be right before
+the first start:
 
 | Setting | Why |
 | --- | --- |
 | `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` | From your Slack app — see [slack-setup.md](slack-setup.md). |
 | `PROJECTS_DIR` | The **parent** directory of your projects. Mounted at `/projects` in the container, so a project at `~/Workspace/api` is `/projects/api` in the mapping. |
 | `SECURITY_ALLOWED_USERS` | The template ships denying everyone. Read on. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Only for the Slack → Claude direction, and not in the template because a mounted `~/.claude` does not carry your login on macOS. Read on. |
 
 ### The access-control setting is not optional
 
@@ -71,6 +72,83 @@ Where the config is looked for, in order:
 2. `$(brew --prefix)/etc/claude-slack-bridge/config.env` — machine-level, if you
    prefer one config for all users of the machine
 3. the `.env` in the installed tree — only relevant when running from a checkout
+
+### Authenticate the Claude CLI
+
+Only the **Slack → Claude** direction needs this. `ask_on_slack` does not: that
+path runs `session.py` in the container as a relay, and the Claude asking the
+question is the one on your host, already logged in.
+
+Without it, the bot answers *"Sorry, I encountered an error processing your
+request."* and the log shows the CLI exiting `rc=1`. Run it by hand to see the
+real reason:
+
+```bash
+docker exec claude-slack-bridge claude -p 'say ok'
+# Not logged in · Please run /login
+```
+
+**On macOS the mounted `~/.claude` cannot carry your login.** Claude Code stores
+its OAuth token as a login-Keychain item, not as a file in that directory, so
+the mount brings your settings, history and `CLAUDE.md` across but not your
+credentials. The container cannot reach the Keychain either: that is the macOS
+Security framework talking to `securityd` over Mach IPC, and the container is a
+Linux VM with neither. Docker shares files, not OS services. On a Linux host the
+CLI writes `~/.claude/.credentials.json` instead, which the mount *does* carry —
+which is why this works there and fails here.
+
+Mint a long-lived token on the host, where the Keychain exists, and hand it to
+the container:
+
+```bash
+claude setup-token                    # on the HOST, not in the container
+```
+
+Put it in your config and restart:
+
+```
+CLAUDE_CODE_OAUTH_TOKEN=<the token it prints>
+```
+
+```bash
+brew services restart claude-slack-bridge
+docker exec claude-slack-bridge claude -p 'say ok'    # should answer now
+```
+
+No compose or Dockerfile change is needed — `env_file` injects everything in
+`config.env` into the container environment, so the variable arrives on its own.
+It lives outside the installed tree, so it survives container recreation,
+`brew upgrade` and reboots.
+
+The cost is a long-lived token in a file rather than in the Keychain — revoke it
+independently if it leaks; `chmod 600` the config, as above.
+
+The one alternative: `docker exec -it claude-slack-bridge claude`, then `/login`.
+That writes `.credentials.json` onto the mounted volume, so it persists too. It
+is interactive, and it gives the container a second credential to refresh — but
+it keeps the credential in a file rather than in the environment, which matters
+below.
+
+**`ANTHROPIC_API_KEY` is not an option here**, although it looks like the obvious
+one. The daemon strips it — along with `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` —
+from the environment before spawning the CLI, so that a prompt-injected run
+cannot exfiltrate it (`_run_claude`, `src/claude_handler.py`). Set it and
+Slack → Claude stays unauthenticated with nothing in the log to say why.
+
+`CLAUDE_CODE_OAUTH_TOKEN` is deliberately *not* stripped, because it is the thing
+that authenticates the subprocess. So unlike your Slack tokens, it is readable by
+the Claude the bridge runs — which runs with `--dangerously-skip-permissions`.
+The `/login` route keeps it out of the environment, though a run with those
+permissions can still read the file. Treat any Slack channel you allowlist as
+trusted with that token.
+
+What does not work, so you don't spend an evening on it: mounting
+`~/Library/Keychains/login.keychain-db` (an encrypted store that only `securityd`
+can open), and copying the item out with
+`security find-generic-password -s "Claude Code-credentials" -w` into
+`.credentials.json` — the container would then refresh that copy while your host
+CLI refreshes the Keychain one, and a refresh on either side can invalidate the
+other.
 
 ## Start it
 
