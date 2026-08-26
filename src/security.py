@@ -97,6 +97,16 @@ class AccessControl:
                            for that dimension.
     - Strict mode        → a missing allowlist dimension is treated as "deny all"
                            for that dimension.
+
+    Two entry points, one per kind of message:
+
+    - ``is_allowed``            — full user+channel check, for anything that can
+                                  start or steer a Claude run.
+    - ``is_allowed_responder``  — user check only, for replies that answer a
+                                  pending ``ask_on_slack`` question. Answering is
+                                  not commanding: the reply is handed to the
+                                  blocked session as plain text, so the channel
+                                  dimension does not apply.
     """
 
     def __init__(self, config: SecurityConfig) -> None:
@@ -139,6 +149,41 @@ class AccessControl:
         logger.debug(
             "Access granted: user_id=%s channel_id=%s is_admin=%s",
             user_id, channel_id, is_admin,
+        )
+        return True
+
+    def is_allowed_responder(self, user_id: str, channel_id: str) -> bool:
+        """
+        Return True if the user may answer a question the bridge asked.
+
+        Applies the user allowlist exactly as ``is_allowed`` does, and skips the
+        channel check entirely. A reply into a thread where a session is blocked
+        on ``ask_on_slack`` only exists because that session chose to post
+        there, so the channel needs no separate authorization — requiring one
+        would mean allowlisting a ``D...`` id per person the bridge may ever ask.
+        The user allowlist still applies: only people you have named can answer.
+
+        Args:
+            user_id:    Slack user ID of the message author.
+            channel_id: Slack channel ID where the reply was posted — used only
+                        for denial logging.
+        """
+        cfg = self._cfg
+
+        if not cfg.enabled:
+            return True
+
+        if cfg.allowed_users:
+            if user_id not in cfg.allowed_users:
+                self._deny(user_id, channel_id, "responder_not_in_allowlist")
+                return False
+        elif cfg.strict_mode:
+            self._deny(user_id, channel_id, "strict_mode_no_user_allowlist")
+            return False
+
+        logger.debug(
+            "Responder access granted: user_id=%s channel_id=%s",
+            user_id, channel_id,
         )
         return True
 

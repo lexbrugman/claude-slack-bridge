@@ -230,3 +230,39 @@ class TestDenialLogging:
         with caplog.at_level(logging.WARNING, logger="security"):
             ac.is_allowed("U1", "C1")
         assert not any("Access denied" in r.message for r in caplog.records)
+
+
+# ---------- AccessControl.is_allowed_responder ----------
+
+class TestIsAllowedResponder:
+    """Replies that answer a pending ask_on_slack question: user check only."""
+
+    def test_disabled_always_allows(self):
+        assert _ac(enabled=False).is_allowed_responder("U-anyone", "D-any") is True
+
+    def test_flexible_empty_user_list_allows(self):
+        assert _ac(enabled=True).is_allowed_responder("U-random", "D-any") is True
+
+    def test_listed_user_allows_despite_strict_empty_channel_list(self):
+        # The point of the method: the channel dimension does not apply, so a
+        # strict config with no allowed channels still lets a named user answer.
+        ac = _ac(enabled=True, strict_mode=True, allowed_users={"U1"})
+        assert ac.is_allowed_responder("U1", "D-unlisted") is True
+
+    def test_listed_user_allows_despite_unlisted_channel(self):
+        ac = _ac(enabled=True, allowed_users={"U1"}, allowed_channels={"C1"})
+        assert ac.is_allowed_responder("U1", "D-unlisted") is True
+
+    def test_unlisted_user_denied(self):
+        ac = _ac(enabled=True, allowed_users={"U1"})
+        assert ac.is_allowed_responder("U-other", "D-any") is False
+
+    def test_strict_empty_user_list_denies(self):
+        ac = _ac(enabled=True, strict_mode=True)
+        assert ac.is_allowed_responder("U1", "D-any") is False
+
+    def test_denial_is_logged(self, caplog):
+        ac = _ac(enabled=True, allowed_users={"U1"}, log_unauthorized=True)
+        with caplog.at_level(logging.WARNING, logger="security"):
+            ac.is_allowed_responder("U-other", "D-any")
+        assert any("responder_not_in_allowlist" in r.getMessage() for r in caplog.records)

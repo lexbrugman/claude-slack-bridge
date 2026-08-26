@@ -184,41 +184,62 @@ class SlackDaemon:
 
         user_id: str = event.get("user", "")
         channel: str = event.get("channel", "")
+        thread_ts: str | None = event.get("thread_ts")
 
-        # Access control: reject unauthorized users/channels before any processing.
-        if not self._access_control.is_allowed(user_id=user_id, channel_id=channel):
-            thread_ts = event.get("thread_ts") or event.get("ts", "")
+        # A reply into a thread where a session is blocked on ``ask_on_slack``
+        # answers a question this bridge asked — it is handed to the waiting
+        # session as plain text and cannot start or steer a Claude run. Such
+        # replies are gated on the user allowlist alone (is_allowed_responder),
+        # so a colleague can answer from their own DM without every ``D...`` id
+        # being allowlisted. The check and the pop happen under one lock so the
+        # entry that was authorized is the entry consumed — and a denied reply
+        # leaves it pending, so an authorized answer can still arrive later.
+        writer: asyncio.StreamWriter | None = None
+        answering = False
+        if thread_ts:
+            async with self._lock:
+                if thread_ts in self._pending:
+                    answering = True
+                    if self._access_control.is_allowed_responder(
+                        user_id=user_id, channel_id=channel
+                    ):
+                        writer = self._pending.pop(thread_ts)
+
+        # Access control: everything that is not such an answer can start or
+        # steer a Claude run and passes the full user+channel check. For an
+        # answer the decision was made above (writer is None means denied).
+        if answering:
+            allowed = writer is not None
+        else:
+            allowed = self._access_control.is_allowed(user_id=user_id, channel_id=channel)
+        if not allowed:
+            reject_ts = thread_ts or event.get("ts", "")
             try:
                 await self._app.client.chat_postMessage(
                     channel=channel,
-                    thread_ts=thread_ts,
+                    thread_ts=reject_ts,
                     text=self._access_control.rejection_message(),
                 )
             except Exception as exc:
                 logger.warning("Failed to send rejection message to %s: %s", channel, exc)
             return
 
-        thread_ts: str | None = event.get("thread_ts")
         text: str = event.get("text", "")
         raw_files: list[dict] = event.get("files") or []
         event_ts: str = event.get("ts", "")
 
         # Case 1: Threaded reply WITH a pending MCP session — forward to session.
-        if thread_ts:
-            async with self._lock:
-                writer = self._pending.pop(thread_ts, None)
-
-            if writer is not None:
-                logger.info("Slack reply in thread %s: %r", thread_ts, text)
-                try:
-                    writer.write(text.encode() + b"\n")
-                    await writer.drain()
-                    logger.info("Reply forwarded to session for thread %s.", thread_ts)
-                except Exception as exc:
-                    logger.warning("Failed to forward reply for %s: %s", thread_ts, exc)
-                finally:
-                    writer.close()
-                return
+        if writer is not None:
+            logger.info("Slack reply in thread %s: %r", thread_ts, text)
+            try:
+                writer.write(text.encode() + b"\n")
+                await writer.drain()
+                logger.info("Reply forwarded to session for thread %s.", thread_ts)
+            except Exception as exc:
+                logger.warning("Failed to forward reply for %s: %s", thread_ts, exc)
+            finally:
+                writer.close()
+            return
 
         # Case 2: Threaded reply with NO pending session — continue Claude conversation.
         if thread_ts:
@@ -245,23 +266,14 @@ class SlackDaemon:
         )
 
     async def _handle_app_mention(self, event: dict[str, Any]) -> None:
-        """Handle app_mention events (bot @mentioned in any channel)."""
-        user_id: str = event.get("user", "")
-        channel: str = event.get("channel", "")
+        """Handle app_mention events (bot @mentioned in any channel).
 
-        if not self._access_control.is_allowed(user_id=user_id, channel_id=channel):
-            thread_ts = event.get("thread_ts") or event.get("ts", "")
-            try:
-                await self._app.client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    text=self._access_control.rejection_message(),
-                )
-            except Exception as exc:
-                logger.warning("Failed to send rejection message to %s: %s", channel, exc)
-            return
-
-        # Delegate to the normal message handler for authorized mentions.
+        Delegates straight to the message handler, which owns ALL access
+        control — including the responder path for answers to pending
+        ``ask_on_slack`` questions. A gate here would re-run the full
+        user+channel check and wrongly reject an authorized answer that
+        happens to @mention the bot.
+        """
         await self._handle_slack_message(event)
 
     async def _handle_reaction_added(self, event: dict[str, Any]) -> None:

@@ -63,8 +63,11 @@ can drive it. Upstream's default is permissive; the template here ships
 denies **everyone including you** until you add your own Slack user ID (Slack
 profile → ⋮ → Copy member ID). See [security.md](security.md).
 
-If you only want the Claude → Slack direction, leave the lists empty. That is
-the closed configuration, and `ask_on_slack` is unaffected by it.
+If you only want the Claude → Slack direction, add to `SECURITY_ALLOWED_USERS`
+the people Claude may ask questions of, and leave the channel list empty. Posting
+a question is never gated, and an *answer* to a pending `ask_on_slack` question
+is gated on the user list alone — the channel list only restricts who can start
+runs, so it can stay empty (deny-all) while colleagues answer from their DMs.
 
 Where the config is looked for, in order:
 

@@ -2,6 +2,7 @@
 
 import asyncio
 
+from security import AccessControl, SecurityConfig
 from slack_daemon import SlackDaemon
 
 
@@ -327,3 +328,101 @@ class TestStatusReactionStop:
         assert "status.9" not in d._trigger_to_thread
         assert {"channel": "C1", "name": "octagonal_sign", "timestamp": "status.9"} \
             in d._app.client.removed
+
+
+class FakeWriter:
+    """Records what Case 1 writes to a blocked session; close() is tracked."""
+
+    def __init__(self) -> None:
+        self.data = b""
+        self.closed = False
+
+    def write(self, chunk: bytes) -> None:
+        self.data += chunk
+
+    async def drain(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TestPendingReplyAccess:
+    """Replies answering a pending ask_on_slack session skip the channel check."""
+
+    @staticmethod
+    def _strict_ac(**kwargs) -> AccessControl:
+        return AccessControl(SecurityConfig(enabled=True, strict_mode=True, **kwargs))
+
+    @staticmethod
+    def _reply(user="U-designer", channel="D-dm", thread="thr.1", text="option B"):
+        return {"user": user, "channel": channel, "thread_ts": thread,
+                "ts": "reply.1", "text": text}
+
+    def test_listed_user_answers_from_unlisted_channel(self, monkeypatch):
+        # The scenario the responder path exists for: the user is allowlisted,
+        # the DM the question was asked in is not, strict mode is on.
+        d = make_daemon(monkeypatch)
+        d._access_control = self._strict_ac(allowed_users={"U-designer"})
+        writer = FakeWriter()
+        d._pending["thr.1"] = writer
+
+        asyncio.run(d._handle_slack_message(self._reply()))
+
+        assert writer.data == b"option B\n"
+        assert writer.closed is True
+        assert "thr.1" not in d._pending
+        assert d._app.client.posted == []  # no rejection
+
+    def test_unlisted_user_is_rejected_and_session_stays_pending(self, monkeypatch):
+        # A denied answer must not consume the session: the person the question
+        # was meant for can still reply after a stranger was turned away.
+        d = make_daemon(monkeypatch)
+        d._access_control = self._strict_ac(allowed_users={"U-designer"})
+        writer = FakeWriter()
+        d._pending["thr.1"] = writer
+
+        asyncio.run(d._handle_slack_message(self._reply(user="U-stranger")))
+
+        assert writer.data == b""
+        assert d._pending["thr.1"] is writer
+        assert len(d._app.client.posted) == 1
+        assert d._app.client.posted[0]["thread_ts"] == "thr.1"
+
+    def test_same_user_without_pending_session_gets_full_check(self, monkeypatch):
+        # No pending session means the reply could start a Claude run, so the
+        # channel allowlist applies again and the unlisted DM is rejected.
+        d = make_daemon(monkeypatch)
+        d._access_control = self._strict_ac(allowed_users={"U-designer"})
+
+        asyncio.run(d._handle_slack_message(self._reply(thread="thr.unknown")))
+
+        assert len(d._app.client.posted) == 1
+
+    def test_app_mention_answer_is_forwarded_not_rejected(self, monkeypatch):
+        # An answer that @mentions the bot also arrives as an app_mention
+        # event. That handler must not re-gate it on the channel allowlist —
+        # access control lives in the message handler it delegates to.
+        d = make_daemon(monkeypatch)
+        d._access_control = self._strict_ac(allowed_users={"U-designer"})
+        writer = FakeWriter()
+        d._pending["thr.1"] = writer
+
+        asyncio.run(d._handle_app_mention(self._reply(text="<@U_bot> option B")))
+
+        assert writer.data == b"<@U_bot> option B\n"
+        assert d._app.client.posted == []
+
+    def test_admin_in_allowed_channel_unaffected(self, monkeypatch):
+        # Regression guard: the ordinary path through is_allowed still works.
+        d = make_daemon(monkeypatch)
+        d._access_control = self._strict_ac(
+            allowed_users={"U-admin"}, admin_users={"U-admin"},
+        )
+        writer = FakeWriter()
+        d._pending["thr.1"] = writer
+
+        asyncio.run(d._handle_slack_message(self._reply(user="U-admin")))
+
+        assert writer.data == b"option B\n"
+        assert d._app.client.posted == []

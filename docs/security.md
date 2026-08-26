@@ -13,6 +13,8 @@ The `SECURITY_*` env vars below let you turn the bridge into a **two-dimensional
 - **Who** — only Slack user IDs in `SECURITY_ALLOWED_USERS` can invoke the bot. Everyone else gets `SECURITY_REJECTION_MESSAGE` and the request is dropped before a Claude session is ever spawned.
 - **Where** — only channel IDs in `SECURITY_ALLOWED_CHANNELS` are routed to Claude. A message in any other channel is ignored, even from an allowed user (unless they are also in `SECURITY_ADMIN_USERS`, which bypasses the channel check).
 
+One kind of message is exempt from the **where** dimension: a thread reply that answers a pending `ask_on_slack` question. Answering is not commanding — the reply is handed to the blocked session as plain text and cannot start or steer a Claude run — so it is gated on the user allowlist alone. That is what lets Claude ask a named colleague a question in their DM and receive the answer without the DM's `D...` id being allowlisted. A denied answer leaves the session waiting, so the person the question was meant for can still reply after a stranger was turned away.
+
 Both checks run in the daemon **before** the message reaches a Claude session, so an unauthorized request never costs API tokens, never touches your filesystem, and never executes a tool.
 
 For a hard lock-down, set `SECURITY_STRICT_MODE=true`: an empty allowlist then means "deny everyone" instead of "allow everyone", so you can't accidentally leave a dimension wide open. Combined with `SECURITY_LOG_UNAUTHORIZED=true`, every denial is logged so you can spot probing attempts.
@@ -81,7 +83,7 @@ SECURITY_ALLOWED_CHANNELS=C07ENG,C07DEVOPS
 SECURITY_ADMIN_USERS=U0123ABC
 ```
 
-With this config, only the two listed users can use the bot, only in the two listed channels, and the admin user can invoke the bot from any channel.
+With this config, only the two listed users can use the bot, only in the two listed channels, and the admin user can invoke the bot from any channel. Both listed users can additionally answer `ask_on_slack` questions wherever Claude asks them — the channel list restricts who can *start* runs, not who can answer.
 
 ---
 
