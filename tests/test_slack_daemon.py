@@ -426,3 +426,58 @@ class TestPendingReplyAccess:
 
         assert writer.data == b"option B\n"
         assert d._app.client.posted == []
+
+
+def _daemon_warnings(caplog) -> list:
+    """WARNING records from slack_daemon only (daemon construction logs elsewhere)."""
+    return [
+        r for r in caplog.records
+        if r.name == "slack_daemon" and r.levelname == "WARNING"
+    ]
+
+
+class TestBenignReactionErrors:
+    """Slack errors meaning "already in the desired state" must not warn."""
+
+    @staticmethod
+    def _api_error(code: str):
+        from slack_sdk.errors import SlackApiError
+
+        return SlackApiError("failed", {"ok": False, "error": code})
+
+    def test_no_reaction_on_remove_is_debug(self, monkeypatch, caplog):
+        d = make_daemon(monkeypatch)
+
+        async def _remove(**kwargs):
+            raise self._api_error("no_reaction")
+
+        d._app.client.reactions_remove = _remove
+        with caplog.at_level("DEBUG", logger="slack_daemon"):
+            asyncio.run(d._remove_stop_reaction("C1", "1.0"))
+        assert not _daemon_warnings(caplog)
+        assert any("No stop reaction left" in r.message for r in caplog.records)
+
+    def test_already_reacted_on_add_is_debug(self, monkeypatch, caplog):
+        d = make_daemon(monkeypatch)
+
+        async def _add(**kwargs):
+            raise self._api_error("already_reacted")
+
+        d._app.client.reactions_add = _add
+        with caplog.at_level("DEBUG", logger="slack_daemon"):
+            asyncio.run(d._add_stop_reaction("C1", "1.0"))
+        assert not _daemon_warnings(caplog)
+
+    def test_other_slack_error_still_warns(self, monkeypatch, caplog):
+        d = make_daemon(monkeypatch)
+
+        async def _remove(**kwargs):
+            raise self._api_error("channel_not_found")
+
+        d._app.client.reactions_remove = _remove
+        with caplog.at_level("WARNING", logger="slack_daemon"):
+            asyncio.run(d._remove_stop_reaction("C1", "1.0"))
+        assert any(
+            r.levelname == "WARNING" and "Failed to remove stop reaction" in r.message
+            for r in caplog.records
+        )

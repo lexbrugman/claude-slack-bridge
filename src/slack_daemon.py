@@ -430,6 +430,11 @@ class SlackDaemon:
             await self._app.client.reactions_add(
                 channel=channel, name="octagonal_sign", timestamp=trigger_ts
             )
+        except SlackApiError as exc:
+            if exc.response.get("error") == "already_reacted":
+                logger.debug("Stop reaction already present on %s", trigger_ts)
+                return
+            logger.warning("Failed to add stop reaction on %s: %s", trigger_ts, exc)
         except Exception as exc:
             logger.warning("Failed to add stop reaction on %s: %s", trigger_ts, exc)
 
@@ -439,6 +444,13 @@ class SlackDaemon:
             await self._app.client.reactions_remove(
                 channel=channel, name="octagonal_sign", timestamp=trigger_ts
             )
+        except SlackApiError as exc:
+            # Expected when the reaction was already moved onto the status
+            # message (or removed by hand): nothing to clean up, not a failure.
+            if exc.response.get("error") == "no_reaction":
+                logger.debug("No stop reaction left to remove on %s", trigger_ts)
+                return
+            logger.warning("Failed to remove stop reaction on %s: %s", trigger_ts, exc)
         except Exception as exc:
             logger.warning("Failed to remove stop reaction on %s: %s", trigger_ts, exc)
 
